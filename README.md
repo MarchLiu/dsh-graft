@@ -39,7 +39,7 @@
 
 ```sh
 # 从 npm 安装
-dsh plugin --profile web add dsh-graft
+dsh plugin --profile web add @mars.liu/dsh-graft
 
 # 或本地开发目录安装
 dsh plugin --profile web add /Users/mars/jobs/dsh-graft

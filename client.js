@@ -15,7 +15,7 @@
 //   conversation.input.dock             — the selection bar (count / target / send)
 
 window.__ModuleLoader__.load({
-  id: 'dsh-graft',
+  id: '@mars.liu/dsh-graft',
   factory: (require) => {
     const module = { exports: {} }
     const exports = module.exports
