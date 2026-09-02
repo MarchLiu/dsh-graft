@@ -1,0 +1,8 @@
+# dsh-graft bundle patch: inserts the plugin row into the profile roster.
+# Installed with: dsh plugin --profile <name> add /Users/mars/jobs/dsh-graft
+#
+# Node-only plugin: mounts agent tools (graft_*) that ride ctx.apiProxy's
+# session.* RPC surface. No config required.
+- insert:
+    - id: graft
+      name: '@mars.liu/dsh-graft'

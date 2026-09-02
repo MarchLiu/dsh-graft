@@ -1,0 +1,28 @@
+{
+  "name": "@mars.liu/dsh-graft",
+  "version": "0.1.0",
+  "description": "Graft, forward and fork DSH sessions: read a slice of one session's log, export it, fork a session at a turn boundary, or forward a selected portion into another session (or a brand-new one) as a self-contained graft message. Agent tools: graft_sessions/graft_search/graft_read/graft_export/graft_fork/graft_forward.",
+  "type": "module",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "sessions",
+    "fork",
+    "transcript"
+  ],
+  "license": "MIT"
+}
