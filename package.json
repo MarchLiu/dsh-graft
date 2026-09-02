@@ -24,5 +24,8 @@
     "fork",
     "transcript"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
 }
