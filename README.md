@@ -1,10 +1,22 @@
 # dsh-graft 🌱
 
-**嫁接**：把一段会话变成另一段会话的养分。DeepSeek Harness 插件，提供三层能力：
+**嫁接**：把一段会话变成另一段会话的养分。DeepSeek Harness 插件，双半区：
 
-1. **切片读取 / 导出** — 读取一个会话日志的任意片段（seq 区间 / 角色 / 关键词过滤），渲染为可读 transcript 或导出为 Markdown / JSON 文件；
-2. **原生分叉** — 在任意已完成轮次边界 `session.fork` 出一个新会话（继承 cwd、模型与 parentSession 血统）；
-3. **转发 / 嫁接** — 把选定片段打包成一条带来源标注的 `<graft>` 消息，转发给另一个已有会话，或先建新会话再注入；目标 Agent 把它当上下文继续干活。
+- **Node 半区**（6 个 agent 工具）：切片读取 / 导出 / 原生分叉 / 转发；
+- **Browser 半区**（`client.js`）：会话页面里的 🌱 嫁接模式——鼠标点选轮次，
+  一键把选中内容发送到另一个会话或全新会话。
+
+## 网页端：嫁接模式
+
+1. 会话标题栏点 **「🌱 嫁接」** 进入选择模式（按钮显示已选计数）；
+2. 每个已完成轮次末尾出现 **「☑ 轮次 #N」** 复选框，点选要嫁接的轮次；
+3. 底部浮条选择目标：任一已有会话，或 **「＋ 新会话（当前工作区）」**；
+4. 点 **「发送嫁接」**——选中内容打包成带 `<graft source=…>` 标注的一条消息
+   注入目标会话（发往新会话时自动在工作区开新会话并跳转过去）。
+
+实现：`client.js` 手写为 client module 系统的闭包工厂格式，零构建步骤；
+只依赖 shell 预载的 `react`，通过 package.json 的 `dsh.client` 声明被宿主
+扫描加载，支持 client-module HMR（改完无需重装）。
 
 ## 工具
 
@@ -27,11 +39,14 @@
 
 ```sh
 # 从 npm 安装
-dsh plugin --profile web add @mars.liu/dsh-graft
+dsh plugin --profile web add dsh-graft
 
 # 或本地开发目录安装
 dsh plugin --profile web add /Users/mars/jobs/dsh-graft
 ```
+
+安装后重启宿主（client 模块图在启动时扫描）。已装的情况下改了源码，
+把改动文件同步进 profile 的 `node_modules/dsh-graft/` 即可，HMR 会热重载。
 
 ## 典型用法
 

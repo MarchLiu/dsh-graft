@@ -5,4 +5,4 @@
 # session.* RPC surface. No config required.
 - insert:
     - id: graft
-      name: '@mars.liu/dsh-graft'
+      name: dsh-graft
