@@ -196,8 +196,13 @@ window.__ModuleLoader__.load({
         controllers.clear()
       }, 'dsh-graft: controllers')
 
+      // The workspace a session is filed under, for minting a sibling session.
+      const workspaceOf = (sessionId) => (workspaces.list.getSnapshot().items ?? [])
+        .find((item) => item.sessionIds?.includes(sessionId))?.workspaceId
+
       // Send the current selection of `sourceId` to `target` ('new' | session id).
       const send = async (sourceId, view, target, setStatus) => {
+        const created = target === 'new'
         const binding = sessions.binding(sourceId)
         if (binding === undefined) throw new Error('源会话尚未加载，无法读取内容')
         const selectedTurns = new Set(view.turns)
@@ -208,21 +213,23 @@ window.__ModuleLoader__.load({
         const text = composeGraft(sourceId, summary?.displayTitle ?? summary?.title, range, transcript)
         setStatus(`发送中 → ${target === 'new' ? '新会话' : target}（${picked} 条）…`)
 
-        // A new target is opened by the host's own New Session path, so that
-        // arm navigates; an existing target receives the graft in place and
-        // leaves the reader where they were.
+        // ctx.workspaces is the Workspace Controller face and owns no New
+        // Session verb (that one lives on the sidebar's injected face), so a
+        // new target is minted straight off the session service, on the
+        // source's own workspace.
         if (target === 'new') {
-          const before = sessions.list.getSnapshot().current
-          workspaces.startSession()
-          target = await poll(() => {
-            const state = sessions.list.getSnapshot()
-            const id = state.current
-            return id && id !== before && state.byId[id]?.blank ? id : null
-          }, '新会话出现')
+          const workspaceId = workspaceOf(sourceId)
+          const cwd = summary?.cwd
+          if (workspaceId === undefined && !cwd) throw new Error('源会话不属于任何工作区，无法新建目标会话')
+          target = await sessions.create(workspaceId !== undefined ? { workspaceId } : { cwd })
         }
         const targetSession = await poll(() => sessions.binding(target)?.session ?? null, '目标会话绑定')
         const result = await targetSession.prompt([{ type: 'text', text }], 'queue')
         if (!result.ok) throw new Error(`发送被拒绝：${result.error?.code ?? 'unknown'} ${result.error?.message ?? ''}`)
+        // Navigating only after the graft lands keeps a rejection visible in
+        // the source session's dock; a freshly minted target is worth
+        // following, an existing one leaves the reader where they were.
+        if (created) sessions.open(target)
         return target
       }
 
