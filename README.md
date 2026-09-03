@@ -31,8 +31,8 @@
 
 ## 设计
 
-零依赖、纯 Node 半区（`inject: ['tools', 'apiProxy']`）。所有读写都走宿主
-`ctx.apiProxy` 的 `session.*` RPC——不直接碰磁盘上的 `session.jsonl(.zstd)`，
+零依赖、纯 Node 半区（`inject: ['tools', 'sessionController']`）。所有读写都走宿主
+`ctx.sessionController` 的 Session API——不直接碰磁盘上的 `session.jsonl(.zstd)`，
 因此对冷会话、热会话、zstd 压缩都天然正确，也不会绕过宿主的边界检查。
 
 ## 安装
