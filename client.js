@@ -11,7 +11,7 @@
 //
 // Slots used (all declared by @deepseek-ai/dsh-client-ui-conversation):
 //   conversation.session.header.actions — the "🌱 嫁接" mode toggle
-//   conversation.chat.turnTail          — per-completed-turn select checkbox
+//   conversation.chat.turnTail          — per-completed-turn select toggle
 //   conversation.input.dock             — the selection bar (count / target / send)
 
 window.__ModuleLoader__.load({
@@ -34,19 +34,39 @@ window.__ModuleLoader__.load({
     // Immutable-view observable (HostObservable shape): the renderer binds it
     // into a use<Name> selector hook, so every published snapshot must be a
     // fresh identity or subscribed components will not re-render.
-    const EMPTY_VIEW = Object.freeze({ mode: false, turns: Object.freeze([]), count: 0 })
+    const EMPTY_VIEW = Object.freeze({ mode: false, turns: Object.freeze([]), count: 0, notice: null })
 
     function createController(sessionId) {
       const listeners = new Set()
       let mode = false
       const turns = new Set()
+      let notice = null
+      let noticeTimer = null
       let view = EMPTY_VIEW
 
       const publish = () => {
-        view = Object.freeze({ mode, turns: Object.freeze([...turns].sort((a, b) => a - b)), count: turns.size })
+        view = Object.freeze({
+          mode,
+          turns: Object.freeze([...turns].sort((a, b) => a - b)),
+          count: turns.size,
+          notice,
+        })
         for (const fn of [...listeners]) {
           try { fn() } catch (error) { console.error('[dsh-graft] subscriber threw:', error) }
         }
+      }
+
+      const complete = (target) => {
+        mode = false
+        turns.clear()
+        notice = `已发送至 ${target}`
+        if (noticeTimer !== null) clearTimeout(noticeTimer)
+        noticeTimer = setTimeout(() => {
+          notice = null
+          noticeTimer = null
+          publish()
+        }, 3500)
+        publish()
       }
 
       return {
@@ -56,47 +76,77 @@ window.__ModuleLoader__.load({
         toggleMode: () => { mode = !mode; if (!mode) turns.clear(); publish() },
         toggleTurn: (turn) => { if (!mode) return; if (turns.has(turn)) turns.delete(turn); else turns.add(turn); publish() },
         clear: () => { turns.clear(); publish() },
+        complete,
+        dispose: () => { if (noticeTimer !== null) clearTimeout(noticeTimer); listeners.clear() },
       }
     }
 
-    // ── transcript assembly (mirrors the node half's composeGraft) ───────────
+    // ── transcript assembly (mirrors the node half's renderEvent) ────────────
 
-    const textOf = (node) => {
-      if (node.kind === 'user') {
-        return (node.content ?? [])
-          .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
-          .map((b) => b.text)
-          .join('\n')
-      }
-      if (node.kind === 'assistant') {
-        return (node.blocks ?? [])
-          .filter((b) => b && b.kind === 'text' && typeof b.text === 'string')
-          .map((b) => b.text)
-          .join('\n')
-      }
-      return ''
-    }
+    // The Session binding's event window is the raw log: entries are tagged
+    // ({ type: 'event' | 'chunks' }) and only whole 'event' records carry the
+    // durable message surfaces a graft quotes.
+    const eventOf = (entry) => (entry?.type === 'event' && typeof entry.event?.seq === 'number'
+      ? entry.event
+      : null)
 
-    // Completed-turn ranges from turnEnds (turn -> turn/end seq): a node
-    // belongs to the first turn whose end seq covers it.
-    const turnOfSeq = (ends, seq) => {
-      for (const [turn, endSeq] of ends) {
-        if (seq <= endSeq) return turn
+    const textBlocks = (blocks) => (Array.isArray(blocks) ? blocks : [])
+      .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+      .map((b) => b.text)
+      .join('\n')
+      .trim()
+
+    const renderEvent = (event) => {
+      if (event.type === 'user/message') {
+        // Only genuine user input: every other source kind is host-injected
+        // context (runtime snapshots, reminders, skill relays).
+        if (event.data?.source?.kind !== 'user') return null
+        const text = textBlocks(event.data.content)
+          .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+          .trim()
+        return text ? `#${event.seq} [user]\n${text}` : null
+      }
+      if (event.type === 'assistant/message') {
+        const text = textBlocks(event.data?.message?.content)
+        return text ? `#${event.seq} [assistant]\n${text}` : null
       }
       return null
     }
 
-    const buildTranscript = (snapshot, selectedTurns) => {
-      const ends = [...snapshot.turnEnds.entries()].sort((a, b) => a[1] - b[1])
-      const nodes = (snapshot.nodes ?? [])
-        .filter((n) => (n.kind === 'user' || n.kind === 'assistant') && typeof n.seq === 'number')
-        .filter((n) => { const t = turnOfSeq(ends, n.seq); return t !== null && selectedTurns.has(t) })
-      const lines = nodes.map((n) => {
-        const role = n.kind === 'user' ? 'user' : 'assistant'
-        return `#${n.seq} [${role}]\n${textOf(n)}`
-      }).filter((line) => line.trim().length > 0)
-      const seqs = nodes.map((n) => n.seq)
-      const range = seqs.length ? `#${Math.min(...seqs)}-${Math.max(...seqs)} turns ${[...selectedTurns].sort((a, b) => a - b).join(',')}` : ''
+    // turn number -> inclusive seq window, keyed off turn/end alone: a turn
+    // owns everything after the previous turn's end through its own end, so
+    // its user message — logged just after turn/start — is always inside, and
+    // a history window that opens mid-session still resolves its first turn.
+    const turnRanges = (entries) => {
+      const ranges = new Map()
+      let from = -Infinity
+      for (const entry of entries) {
+        const event = eventOf(entry)
+        if (event === null || event.type !== 'turn/end') continue
+        ranges.set(event.data?.turn, { from, to: event.seq })
+        from = event.seq + 1
+      }
+      return ranges
+    }
+
+    const buildTranscript = (entries, selectedTurns) => {
+      const ranges = turnRanges(entries)
+      const turns = [...selectedTurns].sort((a, b) => a - b)
+      const lines = []
+      const seqs = []
+      for (const turn of turns) {
+        const range = ranges.get(turn)
+        if (range === undefined) continue
+        for (const entry of entries) {
+          const event = eventOf(entry)
+          if (event === null || event.seq < range.from || event.seq > range.to) continue
+          const line = renderEvent(event)
+          if (line === null) continue
+          lines.push(line)
+          seqs.push(event.seq)
+        }
+      }
+      const range = seqs.length ? `#${Math.min(...seqs)}-${Math.max(...seqs)} turns ${turns.join(',')}` : ''
       return { transcript: lines.join('\n\n'), range, picked: seqs.length }
     }
 
@@ -141,146 +191,214 @@ window.__ModuleLoader__.load({
         }
         return controller
       }
-      ctx.effect(() => () => { controllers.clear() }, 'dsh-graft: controllers')
+      ctx.effect(() => () => {
+        for (const controller of controllers.values()) controller.dispose()
+        controllers.clear()
+      }, 'dsh-graft: controllers')
+
+      // The workspace a session is filed under, for minting a sibling session.
+      const workspaceOf = (sessionId) => (workspaces.list.getSnapshot().items ?? [])
+        .find((item) => item.sessionIds?.includes(sessionId))?.workspaceId
 
       // Send the current selection of `sourceId` to `target` ('new' | session id).
       const send = async (sourceId, view, target, setStatus) => {
-        const source = sessions.binding(sourceId)?.session
-        if (source === undefined) throw new Error('源会话尚未加载，无法读取内容')
+        const created = target === 'new'
+        const binding = sessions.binding(sourceId)
+        if (binding === undefined) throw new Error('源会话尚未加载，无法读取内容')
         const selectedTurns = new Set(view.turns)
-        const { transcript, range, picked } = buildTranscript(source.getSnapshot(), selectedTurns)
+        const entries = binding.eventSource.getSnapshot().entries
+        const { transcript, range, picked } = buildTranscript(entries, selectedTurns)
         if (!picked) throw new Error('选中轮次里没有可发送的文本消息')
         const summary = sessions.list.getSnapshot().byId[sourceId]
         const text = composeGraft(sourceId, summary?.displayTitle ?? summary?.title, range, transcript)
         setStatus(`发送中 → ${target === 'new' ? '新会话' : target}（${picked} 条）…`)
 
+        // ctx.workspaces is the Workspace Controller face and owns no New
+        // Session verb (that one lives on the sidebar's injected face), so a
+        // new target is minted straight off the session service, on the
+        // source's own workspace.
         if (target === 'new') {
-          const before = sessions.list.getSnapshot().current
-          workspaces.startSession()
-          const created = await poll(() => {
-            const state = sessions.list.getSnapshot()
-            const id = state.current
-            if (id && id !== before && state.byId[id]?.blank) return id
-            return null
-          }, '新会话出现')
-          target = created
-        } else {
-          sessions.open(target)
+          const workspaceId = workspaceOf(sourceId)
+          const cwd = summary?.cwd
+          if (workspaceId === undefined && !cwd) throw new Error('源会话不属于任何工作区，无法新建目标会话')
+          target = await sessions.create(workspaceId !== undefined ? { workspaceId } : { cwd })
         }
         const targetSession = await poll(() => sessions.binding(target)?.session ?? null, '目标会话绑定')
         const result = await targetSession.prompt([{ type: 'text', text }], 'queue')
         if (!result.ok) throw new Error(`发送被拒绝：${result.error?.code ?? 'unknown'} ${result.error?.message ?? ''}`)
+        // Navigating only after the graft lands keeps a rejection visible in
+        // the source session's dock; a freshly minted target is worth
+        // following, an existing one leaves the reader where they were.
+        if (created) sessions.open(target)
         return target
       }
 
-      // ── header action: mode toggle ─────────────────────────────────────────
+      // ── header action: compact mode toggle ─────────────────────────────────
 
       const HeaderButton = ({ sessionId, useGraft }) => {
         const graft = useGraft((v) => v)
         const active = graft.mode || graft.count > 0
-        return h('button', {
-          type: 'button',
-          title: '选择轮次，嫁接到另一个会话',
-          onClick: () => controllerFor(sessionId).toggleMode(),
-          style: {
-            display: 'inline-flex', alignItems: 'center', gap: '4px',
-            padding: '3px 12px', borderRadius: '999px', cursor: 'pointer',
-            fontSize: '12px', lineHeight: '18px', fontWeight: 600,
-            border: '1px solid ' + (active ? 'var(--dsw-alias-brand-primary, #3b82f6)' : 'transparent'),
-            color: active ? 'var(--dsw-alias-brand-primary-invert, #fff)' : 'var(--dsw-alias-brand-text, inherit)',
-            background: active ? 'var(--dsw-alias-brand-primary, #3b82f6)' : 'var(--dsw-alias-interactive-bg-hover-accent, rgba(59,130,246,0.15))',
-          },
-        },
-          `🌱 嫁接${graft.count > 0 ? ` · ${graft.count}` : ''}`,
+        const label = graft.notice ?? (active ? `嫁接模式：已选 ${graft.count} 轮` : '选择轮次并嫁接到另一个会话')
+        return h('div', { style: { display: 'inline-flex', alignItems: 'center', gap: '4px' } },
+          h('button', {
+            type: 'button',
+            title: label,
+            'aria-label': label,
+            'aria-pressed': graft.mode,
+            onClick: () => controllerFor(sessionId).toggleMode(),
+            style: {
+              display: 'grid', placeItems: 'center', width: '28px', height: '28px', padding: 0,
+              borderRadius: '6px', cursor: 'pointer', fontSize: '15px', lineHeight: 1,
+              border: '1px solid ' + (active ? 'var(--dsw-alias-brand-primary, #3b82f6)' : 'transparent'),
+              color: active ? 'var(--dsw-alias-brand-primary-invert, #fff)' : 'var(--dsw-alias-label-secondary, inherit)',
+              background: active ? 'var(--dsw-alias-brand-primary, #3b82f6)' : 'transparent',
+            },
+          }, '🌱'),
+          graft.count > 0 && h('span', {
+            title: `已选 ${graft.count} 轮`,
+            style: {
+              minWidth: '16px', height: '16px', padding: '0 4px', borderRadius: '8px',
+              background: 'var(--dsw-alias-brand-primary, #3b82f6)', color: 'var(--dsw-alias-brand-primary-invert, #fff)',
+              fontSize: '10px', fontWeight: 700, lineHeight: '16px', textAlign: 'center',
+            },
+          }, String(graft.count)),
+          graft.notice && h('span', {
+            role: 'status', style: { maxWidth: '120px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--dsw-alias-state-success, #238636)', fontSize: '11px' },
+          }, '已发送'),
         )
       }
 
-      // ── per-turn select checkbox ───────────────────────────────────────────
+      // ── per-turn compact selector ──────────────────────────────────────────
 
+      // The slot owner hands over a TurnLocation ({ turn, start, end, … }),
+      // so the selectable turn number is `turn.turn`.
       const TurnTail = ({ sessionId, turn, useGraft }) => {
         const graft = useGraft((v) => v)
-        if (!graft.mode) return null
-        const selected = graft.turns.includes(turn)
+        const index = turn?.turn
+        if (!graft.mode || typeof index !== 'number') return null
+        const selected = graft.turns.includes(index)
         const accent = 'var(--dsw-alias-brand-primary, #3b82f6)'
+        const label = selected ? `从嫁接中移除轮次 ${index}` : `选择轮次 ${index} 用于嫁接`
         return h('button', {
-          type: 'button',
-          onClick: () => controllerFor(sessionId).toggleTurn(turn),
+          type: 'button', title: label, 'aria-label': label, 'aria-pressed': selected,
+          onClick: () => controllerFor(sessionId).toggleTurn(index),
           style: {
-            display: 'inline-flex', alignItems: 'center', gap: '4px',
-            margin: '2px 0', padding: '2px 10px', borderRadius: '999px', cursor: 'pointer',
-            fontSize: '11px', lineHeight: '16px', fontWeight: selected ? 600 : 400,
+            display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: '5px',
+            minWidth: '54px', height: '26px', margin: '2px 0', padding: '0 7px', borderRadius: '5px', cursor: 'pointer',
+            fontSize: '11px', lineHeight: 1, fontWeight: selected ? 700 : 500,
             border: '1px solid ' + accent,
             color: selected ? 'var(--dsw-alias-brand-primary-invert, #fff)' : accent,
             background: selected ? accent : 'transparent',
           },
-        },
-          `${selected ? '☑' : '☐'} 轮次 #${turn}${selected ? ' · 已选' : ' · 选入嫁接'}`,
-        )
+        }, `${selected ? '✓' : '+'} #${index}`)
       }
 
-      // ── selection dock: count / target / send ──────────────────────────────
+      const workspaceTail = (cwd) => {
+        if (!cwd) return ''
+        const chunks = String(cwd).replace(/\\/g, '/').split('/').filter(Boolean)
+        return chunks.at(-1) ?? cwd
+      }
+
+      const useSessionList = () => React.useSyncExternalStore(
+        (onChange) => sessions.list.subscribe(onChange),
+        () => sessions.list.getSnapshot(),
+        () => sessions.list.getSnapshot(),
+      )
+
+      const useCompactLayout = () => {
+        const query = '(max-width: 640px)'
+        const [compact, setCompact] = React.useState(() => window.matchMedia(query).matches)
+        React.useEffect(() => {
+          const media = window.matchMedia(query)
+          const update = () => setCompact(media.matches)
+          media.addEventListener('change', update)
+          return () => media.removeEventListener('change', update)
+        }, [])
+        return compact
+      }
+
+      // ── selection dock: selection / target / command ───────────────────────
 
       const Dock = ({ sessionId, useGraft }) => {
         const graft = useGraft((v) => v)
+        const list = useSessionList()
+        const compact = useCompactLayout()
         const [target, setTarget] = React.useState('')
         const [status, setStatus] = React.useState(null)
         const [busy, setBusy] = React.useState(false)
         if (!graft.mode) return null
 
-        const state = sessions.list.getSnapshot()
-        const rows = (state.order ?? [])
-          .map((id) => state.byId[id])
+        const rows = (list.ids ?? [])
+          .map((id) => list.byId[id])
           .filter(Boolean)
-          .filter((row) => row.id !== sessionId && !row.blank)
+          .filter((row) => row.id !== sessionId && !row.blank && row.origin !== 'subagent')
 
         const doSend = async () => {
-          if (!target || busy) return
+          if (!target || !graft.count || busy) return
           setBusy(true)
-          setStatus('准备发送…')
+          setStatus('正在发送嫁接内容…')
           try {
             const landed = await send(sessionId, graft, target, setStatus)
-            controllerFor(sessionId).toggleMode()
-            setStatus(`已嫁接到 ${landed === sessionId ? '本会话' : landed}`)
+            const landedRow = sessions.list.getSnapshot().byId[landed]
+            controllerFor(sessionId).complete(landedRow?.displayTitle || workspaceTail(landedRow?.cwd) || landed)
           } catch (error) {
-            setStatus(`❌ ${error?.message ?? String(error)}`)
+            setStatus(`发送失败：${error?.message ?? String(error)}`)
           } finally {
             setBusy(false)
           }
         }
 
+        const accent = 'var(--dsw-alias-brand-primary, #3b82f6)'
+        const muted = 'var(--dsw-alias-label-secondary, #6b7280)'
+        const buttonBase = {
+          height: '30px', padding: '0 10px', borderRadius: '5px', fontSize: '12px', fontWeight: 600,
+        }
         return h('div', {
           style: {
-            display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap',
-            padding: '6px 12px', margin: '4px 0', borderRadius: '10px',
-            border: '1px solid var(--dsw-alias-brand-primary, #3b82f6)', background: 'color-mix(in srgb, var(--dsw-alias-brand-primary, #3b82f6) 8%, transparent)',
-            fontSize: '12px',
+            boxSizing: 'border-box', width: 'min(100%, var(--dsh-composer-card-max-width, 760px))', margin: '0 auto -4px', padding: '0 12px',
+          },
+        }, h('div', {
+          style: {
+            display: 'grid', gridTemplateColumns: compact ? 'minmax(0, 1fr) auto' : 'auto minmax(160px, 1fr) auto', alignItems: 'center', gap: '8px',
+            padding: '7px 8px 7px 12px', border: '1px solid var(--dsw-alias-border-l1, #d0d7de)', borderBottom: 'none', borderRadius: '8px 8px 0 0',
+            background: 'var(--dsw-specific-tip, color-mix(in srgb, ' + accent + ' 7%, transparent))', fontSize: '12px',
           },
         },
-          h('span', { style: { fontWeight: 600, color: 'var(--dsw-alias-brand-primary, #3b82f6)' } }, `🌱 已选 ${graft.count} 轮`),
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px', minWidth: '92px', color: accent, fontWeight: 700, whiteSpace: 'nowrap' } },
+            h('span', { 'aria-hidden': true }, '🌱'),
+            h('span', null, `已选 ${graft.count} 轮`),
+          ),
           h('select', {
             value: target,
-            onChange: (e) => setTarget(e.target.value),
+            onChange: (e) => { setTarget(e.target.value); setStatus(null) },
             disabled: busy,
-            style: { padding: '2px 6px', borderRadius: '6px', fontSize: '12px', maxWidth: '260px' },
+            'aria-label': '嫁接目标会话',
+            style: { gridColumn: compact ? '1 / -1' : undefined, minWidth: 0, width: '100%', height: '30px', padding: '0 8px', borderRadius: '5px', border: '1px solid var(--dsw-alias-border-l2, #d0d7de)', background: 'var(--dsw-alias-bg-base, #fff)', color: 'var(--dsw-alias-label-primary, inherit)', fontSize: '12px' },
           },
             h('option', { value: '' }, '选择目标会话…'),
-            rows.map((row) => h('option', { key: row.id, value: row.id }, `${row.displayTitle ?? row.id}${row.cwd ? ` (${row.cwd})` : ''}`)),
-            h('option', { value: 'new' }, '＋ 新会话（当前工作区）'),
+            h('option', { value: 'new' }, '+ 新会话（当前工作区）'),
+            rows.map((row) => h('option', { key: row.id, value: row.id }, `${row.displayTitle ?? row.id}${workspaceTail(row.cwd) ? ` · ${workspaceTail(row.cwd)}` : ''}`)),
           ),
-          h('button', {
-            type: 'button', onClick: doSend, disabled: !target || busy,
-            style: {
-              padding: '2px 12px', borderRadius: '6px', cursor: !target || busy ? 'default' : 'pointer',
-              fontSize: '12px', border: '1px solid var(--dsw-alias-brand-primary, #3b82f6)', color: 'var(--dsw-alias-brand-primary-invert, #fff)',
-              background: !target || busy ? 'color-mix(in srgb, var(--dsw-alias-brand-primary, #3b82f6) 45%, transparent)' : 'var(--dsw-alias-brand-primary, #3b82f6)',
-            },
-          }, busy ? '发送中…' : '发送嫁接'),
-          h('button', {
-            type: 'button', onClick: () => controllerFor(sessionId).toggleMode(), disabled: busy,
-            style: { padding: '2px 10px', borderRadius: '6px', cursor: 'pointer', fontSize: '12px', border: '1px solid currentColor', background: 'transparent', opacity: 0.8 },
-          }, '退出'),
-          status ? h('span', { style: { opacity: 0.75 } }, status) : null,
-        )
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: '5px', justifyContent: 'flex-end' } },
+            h('button', {
+              type: 'button', title: '清空已选轮次', 'aria-label': '清空已选轮次', onClick: () => controllerFor(sessionId).clear(), disabled: busy || graft.count === 0,
+              style: { ...buttonBase, width: '30px', padding: 0, border: '1px solid transparent', background: 'transparent', color: muted, cursor: busy || graft.count === 0 ? 'default' : 'pointer' },
+            }, '×'),
+            h('button', {
+              type: 'button', title: '退出嫁接模式', 'aria-label': '退出嫁接模式', onClick: () => controllerFor(sessionId).toggleMode(), disabled: busy,
+              style: { ...buttonBase, width: '30px', padding: 0, border: '1px solid transparent', background: 'transparent', color: muted, cursor: busy ? 'default' : 'pointer' },
+            }, '−'),
+            h('button', {
+              type: 'button', onClick: doSend, disabled: !target || !graft.count || busy,
+              style: {
+                ...buttonBase, border: '1px solid ' + accent, color: 'var(--dsw-alias-brand-primary-invert, #fff)',
+                background: !target || !graft.count || busy ? 'color-mix(in srgb, ' + accent + ' 45%, transparent)' : accent,
+                cursor: !target || !graft.count || busy ? 'default' : 'pointer',
+              },
+            }, busy ? '发送中…' : '发送嫁接'),
+          ),
+          status && h('div', { role: 'status', style: { gridColumn: compact ? '1 / -1' : '2 / -1', overflow: 'hidden', color: status.startsWith('发送失败') ? 'var(--dsw-alias-state-error, #cf222e)' : muted, fontSize: '11px', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, status),
+        ))
       }
 
       ctx.effect(() => {
