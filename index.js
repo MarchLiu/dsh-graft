@@ -1,7 +1,7 @@
 /**
  * dsh-graft — 嫁接：把一段会话变成另一段会话的养分。
  *
- * Agent tools over ctx.apiProxy's session.* RPC surface (no disk surgery):
+ * Agent tools over ctx.sessionController's Session API (no disk surgery):
  *  - graft_sessions  list sessions (id / title / cwd / updated / lineage)
  *  - graft_search    full-text search across session surfaces
  *  - graft_read      read a session log slice as a readable transcript
@@ -21,21 +21,11 @@ import { isAbsolute, join } from 'node:path'
 
 export const name = 'dsh-graft'
 
-/** Tools registry + the transport-agnostic host gateway. */
-export const inject = ['tools', 'apiProxy']
+/** Tools registry + the host-owned Session controller. */
+export const inject = ['tools', 'sessionController']
 
 const DEFAULT_MAX_CHARS = 60000
-
-// ── RPC plumbing ─────────────────────────────────────────────────────────────
-
-const call = async (apiProxy, method, payload) => {
-  const response = await apiProxy.sessions[method]({ rpcId: randomUUID(), payload })
-  const result = response?.result
-  if (!result) throw new Error(`session.${method}: no result`)
-  if (result.ok) return result.value
-  const details = result.error?.details ? ` (${JSON.stringify(result.error.details)})` : ''
-  throw new Error(`session.${method} failed [${result.error?.code ?? 'unknown'}]: ${result.error?.message ?? 'error'}${details}`)
-}
+const freshSignal = () => new AbortController().signal
 
 // ── transcript rendering ─────────────────────────────────────────────────────
 
@@ -98,31 +88,16 @@ export function renderTranscript(events, opts = {}) {
 
 // ── history paging ───────────────────────────────────────────────────────────
 
-/** Collect events with seq in [fromSeq, toSeq] (either bound optional), paging backwards. */
-const collectRange = async (apiProxy, sessionId, { fromSeq, toSeq, maxEvents = 4000 } = {}) => {
-  const collected = []
-  let cursor = toSeq // undefined = tail page first
-  let hasMore = true
-  while (hasMore) {
-    const page = await call(apiProxy, 'history', {
-      sessionId,
-      ...(cursor !== undefined ? { beforeSeq: cursor } : {}),
-      maxMessages: 100,
-    })
-    for (const entry of page.events ?? []) {
-      const seq = entry?.event?.seq
-      if (seq === undefined) continue
-      if (fromSeq !== undefined && seq < fromSeq) { hasMore = false; break }
-      if (toSeq !== undefined && seq > toSeq) continue
-      collected.push(entry.event)
-    }
-    hasMore = page.hasMore === true && hasMore
-    const seqs = (page.events ?? []).map((e) => e?.event?.seq).filter((n) => typeof n === 'number')
-    if (!seqs.length) break
-    cursor = Math.min(...seqs)
-    if (collected.length >= maxEvents) break
-  }
-  return collected.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))
+/** Collect events with seq in [fromSeq, toSeq] (either bound optional). */
+const collectRange = async (sessionController, sessionId, { fromSeq, toSeq, maxEvents = 4000 } = {}) => {
+  const inspection = await sessionController.inspect(sessionId, freshSignal())
+  const events = (inspection.events ?? []).filter((event) => {
+    const seq = event?.seq
+    return seq !== undefined
+      && (fromSeq === undefined || seq >= fromSeq)
+      && (toSeq === undefined || seq <= toSeq)
+  })
+  return events.slice(-maxEvents).sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))
 }
 
 const eventMatches = (event, { search, role }) => {
@@ -172,16 +147,16 @@ const summaryLine = (s) => {
   ].filter(Boolean).join('\n')
 }
 
-const listSummaries = async (apiProxy) => {
-  const { items } = await call(apiProxy, 'list', {})
+const listSummaries = async (sessionController) => {
+  const { items } = await sessionController.list({}, freshSignal())
   return (items ?? []).map((s) => ({
     ...s,
     title: s.projections?.values?.title ?? '',
   }))
 }
 
-const resolveSession = async (apiProxy, idOrPrefix) => {
-  const items = await listSummaries(apiProxy)
+const resolveSession = async (sessionController, idOrPrefix) => {
+  const items = await listSummaries(sessionController)
   const exact = items.find((s) => s.sessionId === idOrPrefix)
   if (exact) return exact
   // accept a bare uuid prefix too: "49a82573" matches "session-49a82573-…"
@@ -225,7 +200,7 @@ const composeGraft = ({ sourceId, sourceTitle, range, transcript, note, instruct
 // ── plugin ───────────────────────────────────────────────────────────────────
 
 export function apply(ctx) {
-  const apiProxy = ctx.apiProxy
+  const sessionController = ctx.sessionController
   const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone ?? 'UTC'
   const text = (s) => [{ type: 'text', text: s }]
   const toolOutput = {
@@ -239,7 +214,7 @@ export function apply(ctx) {
     parameters: { type: 'object', properties: {} },
     output: toolOutput,
     execute: async () => {
-      const items = await listSummaries(apiProxy)
+      const items = await listSummaries(sessionController)
       if (!items.length) return '(no sessions found)'
       return items.map(summaryLine).join('\n')
     },
@@ -255,9 +230,12 @@ export function apply(ctx) {
     },
     output: toolOutput,
     execute: async (args) => {
-      const { items, hasMore } = await call(apiProxy, 'search', { query: String(args.query) }, 'search')
+      const { items, hasMore } = await sessionController.search(
+        { query: String(args.query) },
+        freshSignal(),
+      )
       if (!items?.length) return `(no matches for "${args.query}")`
-      const summaries = await listSummaries(apiProxy)
+      const summaries = await listSummaries(sessionController)
       const byId = new Map(summaries.map((s) => [s.sessionId, s]))
       return [
         ...items.map((hit) => {
@@ -270,8 +248,8 @@ export function apply(ctx) {
   })
 
   const readSlice = async (args) => {
-    const source = await resolveSession(apiProxy, args.session)
-    const events = await collectRange(apiProxy, source.sessionId, {
+    const source = await resolveSession(sessionController, args.session)
+    const events = await collectRange(sessionController, source.sessionId, {
       fromSeq: args.fromSeq !== undefined ? Number(args.fromSeq) : undefined,
       toSeq: args.toSeq !== undefined ? Number(args.toSeq) : undefined,
     })
@@ -370,8 +348,8 @@ export function apply(ctx) {
     },
     output: toolOutput,
     execute: async (args) => {
-      const source = await resolveSession(apiProxy, args.session)
-      const { sessionId } = await call(apiProxy, 'fork', {
+      const source = await resolveSession(sessionController, args.session)
+      const { sessionId } = await sessionController.fork({
         sessionId: source.sessionId,
         ...(args.atSeq !== undefined ? { atSeq: Number(args.atSeq) } : {}),
       })
@@ -420,7 +398,7 @@ export function apply(ctx) {
         const ns = args.newSession ?? {}
         const cwd = ns.cwd || source.cwd
         if (!cwd && !ns.workspaceId) return 'no target and no newSession.cwd/workspaceId and the source has no cwd; cannot create a session'
-        const { sessionId } = await call(apiProxy, 'create', {
+        const { sessionId } = await sessionController.create({
           // host accepts at most one of workspaceId / cwd
           ...(ns.workspaceId ? { workspaceId: ns.workspaceId } : { cwd }),
           ...(ns.agentPreset ? { agentPreset: ns.agentPreset } : {}),
@@ -428,10 +406,10 @@ export function apply(ctx) {
         targetId = sessionId
         created = ` (new session, ${ns.workspaceId ? `workspace ${ns.workspaceId}` : `cwd ${cwd}`})`
         if (ns.title) {
-          try { await call(apiProxy, 'rename', { sessionId: targetId, title: String(ns.title) }) } catch { /* title is best-effort */ }
+          try { await sessionController.rename({ sessionId: targetId, title: String(ns.title) }) } catch { /* title is best-effort */ }
         }
       } else {
-        targetId = (await resolveSession(apiProxy, args.target)).sessionId
+        targetId = (await resolveSession(sessionController, args.target)).sessionId
       }
       const grafted = composeGraft({
         sourceId: source.sessionId,
@@ -442,12 +420,13 @@ export function apply(ctx) {
         instruction: args.instruction,
         maxChars: Number(args.maxChars ?? DEFAULT_MAX_CHARS),
       })
-      await call(apiProxy, 'prompt', {
+      await sessionController.prompt({
+        requestId: randomUUID(),
         sessionId: targetId,
         mode: args.steer ? 'steer' : 'queue',
         content: text(grafted),
         clientTimeZone: timeZone,
-      })
+      }, freshSignal())
       return [
         `grafted ${shown.length} event(s) from ${source.sessionId} (${shown[0]?.seq}..${shown[shown.length - 1]?.seq})`,
         `into ${targetId}${created}`,
