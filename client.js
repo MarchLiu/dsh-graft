@@ -270,11 +270,12 @@ window.__ModuleLoader__.load({
 
       // ── per-turn compact selector ──────────────────────────────────────────
 
-      // The slot owner hands over a TurnLocation ({ turn, start, end, … }),
-      // so the selectable turn number is `turn.turn`.
+      // The slot owner hands over the completed-turn number (`turn`, dsh
+      // >= 0.1.2-rc.1; older hosts passed a TurnLocation object with a
+      // `.turn` field), so both shapes are accepted here.
       const TurnTail = ({ sessionId, turn, useGraft }) => {
         const graft = useGraft((v) => v)
-        const index = turn?.turn
+        const index = typeof turn === 'number' ? turn : turn?.turn
         if (!graft.mode || typeof index !== 'number') return null
         const selected = graft.turns.includes(index)
         const accent = 'var(--dsw-alias-brand-primary, #3b82f6)'
