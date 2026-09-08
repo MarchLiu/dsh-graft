@@ -82,7 +82,7 @@ function install() {
 }
 
 test('declares the session controller dependency', () => {
-  assert.deepEqual(inject, ['tools', 'sessionController'])
+  assert.deepEqual(inject, ['tools', 'sessionController', 'workspaceRegistry'])
 })
 
 test('routes session operations through sessionController', async () => {

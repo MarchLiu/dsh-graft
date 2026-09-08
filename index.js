@@ -21,11 +21,38 @@ import { isAbsolute, join } from 'node:path'
 
 export const name = 'dsh-graft'
 
-/** Tools registry + the host-owned Session controller. */
-export const inject = ['tools', 'sessionController']
+/** Tools registry + the host-owned Session controller and workspace registry. */
+export const inject = ['tools', 'sessionController', 'workspaceRegistry']
 
 const DEFAULT_MAX_CHARS = 60000
 const freshSignal = () => new AbortController().signal
+
+/**
+ * Best-effort: account a freshly created/forked session in the host's
+ * workspace registry (ctx.workspaceRegistry) so the web sidebar groups it
+ * under its workspace instead of "未分组".
+ *
+ * Sessions created through the GUI are attached by the client; headless
+ * graft_* creations used to skip this, leaving the real session ungrouped
+ * while the workspace slot could be taken by a blank client draft.
+ * Mirrors dsh-host-apiproxy's workspace.insertSessionBefore path:
+ * WorkspaceEntity.attachSession validates the session cwd against the
+ * workspace path, so a mismatched cwd is a no-op failure we swallow.
+ * Returns a short status fragment ('' when nothing was attached).
+ */
+const attachToWorkspace = async (ctx, sessionId, { workspaceId, cwd } = {}) => {
+  try {
+    const registry = ctx.workspaceRegistry ?? ctx.get?.('workspaceRegistry')
+    if (!registry) return ''
+    const ws = workspaceId
+      ? registry.get(workspaceId)
+      : cwd ? await registry.resolveByPath(cwd) : undefined
+    if (!ws) return ''
+    await ws.attachSession(sessionId)
+    return ` (attached to workspace "${ws.title ?? ws.record?.title ?? String(workspaceId ?? cwd)}")`
+  } catch { /* grouping is best-effort; never fail the graft on it */ }
+  return ''
+}
 
 // ── transcript rendering ─────────────────────────────────────────────────────
 
@@ -353,7 +380,8 @@ export function apply(ctx) {
         sessionId: source.sessionId,
         ...(args.atSeq !== undefined ? { atSeq: Number(args.atSeq) } : {}),
       })
-      return `forked ${source.sessionId} -> ${sessionId} (new session, cwd ${source.cwd ?? '?'})`
+      const attached = await attachToWorkspace(ctx, sessionId, { cwd: source.cwd })
+      return `forked ${source.sessionId} -> ${sessionId} (new session, cwd ${source.cwd ?? '?'})${attached}`
     },
   })
 
@@ -405,6 +433,10 @@ export function apply(ctx) {
         })
         targetId = sessionId
         created = ` (new session, ${ns.workspaceId ? `workspace ${ns.workspaceId}` : `cwd ${cwd}`})`
+        created += await attachToWorkspace(ctx, targetId, {
+          workspaceId: ns.workspaceId,
+          cwd: ns.workspaceId ? undefined : cwd,
+        })
         if (ns.title) {
           try { await sessionController.rename({ sessionId: targetId, title: String(ns.title) }) } catch { /* title is best-effort */ }
         }
