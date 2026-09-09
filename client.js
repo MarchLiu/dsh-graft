@@ -9,10 +9,16 @@
 // Zero build step: edit this file, reload — the host's client-module HMR
 // stat-polls this bundle and reloads the plugin on change.
 //
-// Slots used (all declared by @deepseek-ai/dsh-client-ui-conversation):
+// Slots used:
 //   conversation.session.header.actions — the "🌱 嫁接" mode toggle
-//   conversation.chat.turnTail          — per-completed-turn select toggle
-//   conversation.input.dock             — the selection bar (count / target / send)
+//       (declared by @deepseek-ai/dsh-client-ui-conversation)
+//   conversation.chat.assistant-actions — per-turn "+ #N" select toggle in the
+//       finalized assistant action row (LIST slot, declared by
+//       @deepseek-ai/dsh-client-ui-chat; entries coexist by id/order with the
+//       host's own feedback entry, so nothing can displace it — unlike the
+//       turnTail CHAIN slot, where the host deliverables badge's registration
+//       order wins every file-producing turn)
+//   conversation.input.dock — the selection bar (count / target / send)
 
 window.__ModuleLoader__.load({
   id: '@mars.liu/dsh-graft',
@@ -165,6 +171,52 @@ window.__ModuleLoader__.load({
       return parts.join('\n')
     }
 
+    // ── message-id → turn index ──────────────────────────────────────────────
+
+    // The assistant-actions list slot hands over only the closing message's
+    // durable id; the turn number is resolved against this index, derived
+    // from the same binding event window the transcript builder reads: an
+    // assistant/message event carries both its message id (`data.message.id`,
+    // which the chat's closing node surfaces as the slot's messageId) and its
+    // turn (`data.turn`). HostObservable shape: getSnapshot identity is stable
+    // per entries identity, so selector hooks comparing mapped numbers never
+    // churn.
+    const EMPTY_TURNS = new Map()
+
+    const createTurnIndex = (eventSource) => {
+      const listeners = new Set()
+      let detach = null
+      let cache = null
+      return {
+        getSnapshot: () => {
+          const entries = eventSource.getSnapshot().entries
+          if (cache?.entries !== entries) {
+            const turns = new Map()
+            for (const entry of Array.isArray(entries) ? entries : []) {
+              const event = eventOf(entry)
+              if (event === null || event.type !== 'assistant/message') continue
+              const id = event.data?.message?.id
+              if (typeof id === 'string' && typeof event.data?.turn === 'number') turns.set(id, event.data?.turn)
+            }
+            cache = { entries, turns }
+          }
+          return cache.turns
+        },
+        subscribe: (listener) => {
+          listeners.add(listener)
+          if (detach === null) {
+            detach = eventSource.subscribe(() => { for (const fn of [...listeners]) fn() })
+          }
+          return () => {
+            listeners.delete(listener)
+            if (listeners.size === 0 && detach !== null) { detach(); detach = null }
+          }
+        },
+      }
+    }
+
+    const EMPTY_TURN_INDEX = { getSnapshot: () => EMPTY_TURNS, subscribe: () => () => {} }
+
     const poll = async (probe, describe) => {
       const deadline = Date.now() + POLL_TIMEOUT
       for (;;) {
@@ -268,14 +320,18 @@ window.__ModuleLoader__.load({
         )
       }
 
-      // ── per-turn compact selector ──────────────────────────────────────────
+      // ── per-turn select toggle (assistant action row) ──────────────────────
 
-      // The slot owner hands over the completed-turn number (`turn`, dsh
-      // >= 0.1.2-rc.1; older hosts passed a TurnLocation object with a
-      // `.turn` field), so both shapes are accepted here.
-      const TurnTail = ({ sessionId, turn, useGraft }) => {
+      // Rides the assistant-actions LIST slot inside the closing message's
+      // action row (between copy and branch). The list owner hands over only
+      // the durable message id; the turn number arrives through the session's
+      // message→turn index hook. Non-latest turns reveal their action row on
+      // hover — the same affordance as the host's copy/branch buttons, and the
+      // price of leaving the turnTail chain slot, where the host deliverables
+      // badge's earlier registration forever won every file-producing turn.
+      const TurnPick = ({ sessionId, messageId, useGraft, useTurnIndex }) => {
         const graft = useGraft((v) => v)
-        const index = typeof turn === 'number' ? turn : turn?.turn
+        const index = useTurnIndex((turns) => turns.get(messageId))
         if (!graft.mode || typeof index !== 'number') return null
         const selected = graft.turns.includes(index)
         const accent = 'var(--dsw-alias-brand-primary, #3b82f6)'
@@ -284,8 +340,8 @@ window.__ModuleLoader__.load({
           type: 'button', title: label, 'aria-label': label, 'aria-pressed': selected,
           onClick: () => controllerFor(sessionId).toggleTurn(index),
           style: {
-            display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: '5px',
-            minWidth: '54px', height: '26px', margin: '2px 0', padding: '0 7px', borderRadius: '5px', cursor: 'pointer',
+            display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: '4px',
+            height: '22px', margin: 0, padding: '0 8px', borderRadius: '11px', cursor: 'pointer',
             fontSize: '11px', lineHeight: 1, fontWeight: selected ? 700 : 500,
             border: '1px solid ' + accent,
             color: selected ? 'var(--dsw-alias-brand-primary-invert, #fff)' : accent,
@@ -403,9 +459,20 @@ window.__ModuleLoader__.load({
       }
 
       ctx.effect(() => {
-        // The hooks share binds the per-session controller as a use<Name>
-        // selector hook: inject carries it, components subscribe through it.
-        const withGraft = (sessionId) => ({ hooks: { graft: controllerFor(sessionId) } })
+        // The hooks share binds the per-session controller and the session's
+        // message→turn index as use<Name> selector hooks: inject carries
+        // them, components subscribe through them. The index is minted per
+        // inject face (entry × session binding), so its lifetime rides the
+        // renderer's own inject cache and a reopened session re-resolves its
+        // binding instead of holding a stale eventSource. A not-yet-loaded
+        // binding degrades to the empty index (the picker stays hidden).
+        const turnIndexOf = (sessionId) => {
+          const binding = sessions.binding(sessionId)
+          return binding === undefined ? EMPTY_TURN_INDEX : createTurnIndex(binding.eventSource)
+        }
+        const withGraft = (sessionId) => ({
+          hooks: { graft: controllerFor(sessionId), turnIndex: turnIndexOf(sessionId) },
+        })
         const disposers = []
         const slot = (name, config, Component) => {
           try {
@@ -417,7 +484,7 @@ window.__ModuleLoader__.load({
           }
         }
         slot('conversation.session.header.actions', { id: 'graft', order: 50, inject: withGraft }, HeaderButton)
-        slot('conversation.chat.turnTail', { id: 'graft', select: () => ({ graft: true }), inject: withGraft }, TurnTail)
+        slot('conversation.chat.assistant-actions', { id: 'graft', order: 20, inject: withGraft }, TurnPick)
         slot('conversation.input.dock', { id: 'graft', order: 40, inject: withGraft }, Dock)
         return () => { for (const dispose of disposers) dispose() }
       }, 'dsh-graft: slots')
