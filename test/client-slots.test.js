@@ -6,10 +6,17 @@ import test from 'node:test'
 // react. The components under test are plain functions over props (hooks
 // arrive as inject-face props), so no renderer is needed.
 let bundle = null
-globalThis.window = { __ModuleLoader__: { load: (candidate) => { bundle = candidate } } }
+globalThis.window = {
+  __ModuleLoader__: { load: (candidate) => { bundle = candidate } },
+  addEventListener() {},
+  removeEventListener() {},
+}
 await import('../client.js')
 
-const reactStub = { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }) }
+const reactStub = {
+  createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
+  useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot(),
+}
 const client = bundle.factory((name) => {
   if (name === 'react') return reactStub
   throw new Error(`unexpected require: ${name}`)
@@ -61,7 +68,15 @@ const sessionsWith = (eventSource) => ({
 
 const install = (sessions) => {
   const registrations = []
+  const dictionaries = new Map()
+  const localeSnapshot = { active: 'zh', locales: [{ id: 'en' }, { id: 'zh' }, { id: 'tr' }], revision: 0 }
   client.apply({
+    locale: {
+      getSnapshot: () => localeSnapshot,
+      subscribe: () => () => {},
+      register: (_namespace, language, dictionary) => { dictionaries.set(language, dictionary); return () => dictionaries.delete(language) },
+      bind: () => (key, values = {}) => dictionaries.get('zh')[key].replace(/\{(\w+)\}/g, (match, name) => String(values[name] ?? match)),
+    },
     sessions,
     workspaces: { list: { getSnapshot: () => ({ items: [] }) } },
     effect: (fn) => fn(),
@@ -78,7 +93,7 @@ const actionRegistration = (registrations) =>
 
 test('registers the browser bundle under the plugin id', () => {
   assert.equal(bundle.id, '@mars.liu/dsh-graft')
-  assert.deepEqual(client.inject, ['slots', 'sessions', 'workspaces'])
+  assert.deepEqual(client.inject, ['slots', 'sessions', 'workspaces', 'locale'])
   assert.equal(typeof client.apply, 'function')
 })
 

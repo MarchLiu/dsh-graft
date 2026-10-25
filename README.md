@@ -33,6 +33,22 @@ chain 型单赢家槽位：宿主 deliverables（「本次产出」文件徽章�
 产出的轮次永远由它当选，graft 的按钮被挤掉（0.2.4 迁移的根因）。list 槽位没有
 选举问题；轮次号由 messageId 从会话事件窗口的 `assistant/message` 记录反查得到。
 
+## Interface languages / Arayüz dilleri
+
+Graft supports **English**, **Türkçe**, and **简体中文** in its browser interface,
+including tooltips, accessible labels, progress/error messages, and the context
+notice attached to UI-forwarded transcripts. Open 🌱 selection mode and use the
+language selector in the dock. **Auto** follows the Harness language live (with
+English fallback); an explicit language applies only to Graft and is remembered
+in this browser.
+Changing Graft's language never changes the Harness language, model, provider,
+or reasoning settings. Agent tool names and the original transcript stay intact.
+
+Graft arayüzü **Türkçe**, **İngilizce** ve **Çince** destekler. 🌱 aktarım modunu açıp
+paneldeki dil seçicisinden **Türkçe** seçin. **Otomatik**, Harness dilini izler;
+açıkça seçilen dil yalnızca Graft için bu tarayıcıda saklanır. Dil seçimi yerel
+modeli, sağlayıcıyı, düşünme ayarlarını veya sohbet içeriğini değiştirmez.
+
 ## 工具
 
 | 工具 | 作用 |
